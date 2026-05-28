@@ -8,7 +8,10 @@ import tempfile
 import re
 import json
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(BASE_DIR, ".env")
+
+load_dotenv(env_path)
 
 app = FastAPI()
 
@@ -21,8 +24,9 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in .env file")
+    raise ValueError(f"GROQ_API_KEY not found in: {env_path}")
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -69,7 +73,7 @@ Rules:
 """
 
 def clean_text(text):
-    text = str(text).lower()
+    text = str(text)
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^a-zA-Z0-9\s.,:/@+\-#()]", "", text)
     return text.strip()
@@ -77,23 +81,37 @@ def clean_text(text):
 def extract_pdf_text(file_path):
     return extract_text(file_path)
 
+@app.get("/")
+async def root():
+    return {
+        "message": "AI Resume Ranker API Running"
+    }
+
 @app.post("/predict")
 async def predict_resume(file: UploadFile = File(...)):
-    suffix = os.path.splitext(file.filename)[1].lower()
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported"
+        )
 
-    if suffix != ".pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    tmp_path = None
 
     try:
-        resume_text = extract_pdf_text(tmp_path)
-        cleaned = clean_text(resume_text)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        if not cleaned.strip():
-            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+        resume_text = extract_pdf_text(tmp_path)
+
+        if not resume_text or not resume_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract text from PDF"
+            )
+
+        cleaned_text = clean_text(resume_text)
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -104,7 +122,7 @@ async def predict_resume(file: UploadFile = File(...)):
                 },
                 {
                     "role": "user",
-                    "content": f"Analyze this developer resume and rank it:\n\n{cleaned}"
+                    "content": f"Analyze this developer resume and rank it:\n\n{cleaned_text}"
                 }
             ],
             temperature=0.3,
@@ -113,12 +131,17 @@ async def predict_resume(file: UploadFile = File(...)):
 
         result = response.choices[0].message.content.strip()
 
+        result = result.replace("```json", "").replace("```", "").strip()
+
         try:
             parsed_result = json.loads(result)
-        except json.JSONDecodeError:
+        except Exception:
             raise HTTPException(
                 status_code=500,
-                detail="Model did not return valid JSON"
+                detail={
+                    "error": "Model did not return valid JSON",
+                    "raw_response": result
+                }
             )
 
         return {
@@ -127,12 +150,15 @@ async def predict_resume(file: UploadFile = File(...)):
             "analysis": parsed_result
         }
 
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    except HTTPException as e:
+        raise e
 
-@app.get("/")
-async def root():
-    return {
-        "message": "AI Resume Ranker API Running"
-    }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
