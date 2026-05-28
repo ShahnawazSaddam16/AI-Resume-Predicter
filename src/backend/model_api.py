@@ -1,15 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pdfminer.high_level import extract_text
-from dotenv import load_dotenv
-from groq import Groq
-
 import os
 import tempfile
 import re
-import json
-
-load_dotenv()
 
 app = FastAPI()
 
@@ -21,103 +15,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- ENV ----------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in .env file")
+model = joblib.load(r"C:\\ML Projects\\AI Resume Predicter\\resume_classifier.pkl")
 
-client = Groq(api_key=GROQ_API_KEY)
-
-# ---------------- PROMPT ----------------
-SYSTEM_PROMPT = """
-You are an expert HR recruiter and senior software engineer.
-
-Analyze and rank a developer resume.
-
-Return ONLY valid JSON:
-
-{
-  "candidate_level": "Beginner/Intermediate/Advanced",
-  "score": 0,
-  "strengths": [],
-  "weaknesses": [],
-  "recommended_roles": [],
-  "final_verdict": ""
-}
-
-Rules:
-- Score must be 0–100
-- Return ONLY JSON
-"""
-
-# ---------------- HELPERS ----------------
-def clean_text(text: str) -> str:
+def clean_text(text):
     text = str(text).lower()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^a-zA-Z0-9\s.,:/@+\-#()]", "", text)
-    return text.strip()
+    text = re.sub(r"[^a-zA-Z0-9 ]", "", text)
+    return text
 
-
-def extract_pdf_text(file_path: str) -> str:
-    return extract_text(file_path)
-
-
-# ---------------- ROUTES ----------------
-@app.get("/")
-async def root():
-    return {"message": "AI Resume Ranker API Running"}
-
+def extract_pdf_text(file_path):
+    text = extract_text(file_path)
+    return text
 
 @app.post("/predict")
 async def predict_resume(file: UploadFile = File(...)):
+    suffix = os.path.splitext(file.filename)[1]
 
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
 
-    tmp_path = None
+    resume_text = extract_pdf_text(tmp_path)
 
-    try:
-        # Save temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+    os.remove(tmp_path)
 
-        # Extract text
-        resume_text = extract_pdf_text(tmp_path)
-        cleaned = clean_text(resume_text)
+    cleaned = clean_text(resume_text)
 
-        if not cleaned.strip():
-            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+    prediction = model.predict([cleaned])[0]
+    probabilities = model.predict_proba([cleaned])[0]
+    confidence = float(max(probabilities)) * 100
 
-        # Groq request
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Analyze this resume:\n\n{cleaned}"}
-            ],
-            temperature=0.3,
-            max_tokens=1200
-        )
-
-        result = response.choices[0].message.content.strip()
-
-        # Parse JSON safely
-        try:
-            parsed_result = json.loads(result)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=500,
-                detail="Model did not return valid JSON"
-            )
-
-        return {
-            "success": True,
-            "filename": file.filename,
-            "analysis": parsed_result
-        }
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    return {
+        "category": prediction,
+        "confidence": round(confidence, 2)
+    }
